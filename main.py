@@ -6,7 +6,7 @@ app = FastAPI()
 security = HTTPBearer()
 
 # O token real será lido de uma variável de ambiente (definida no Render)
-API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN", "senha_padrao_para_testes")
+API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN")
 
 def minha_funcao_original(nome: str):
     return f"Olá, {nome}! A API está funcionando."
