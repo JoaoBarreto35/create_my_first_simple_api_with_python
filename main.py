@@ -35,7 +35,7 @@ def minha_funcao_original(api_key,modelo,CONTEXTO_CLASSIFICACAO,texto):
 
     except Exception as e:
 
-        return False, str(e)
+        return False, f"{e}"
 
 @app.get("/api/executar")
 def executar_funcao(api_key,modelo,CONTEXTO_CLASSIFICACAO,texto, credentials: HTTPAuthorizationCredentials = Security(security)):
