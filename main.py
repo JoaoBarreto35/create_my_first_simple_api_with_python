@@ -50,8 +50,8 @@ def bridge(url, token):
             return []
         else:
             return []
-    except:
-        return []
+    except Exception as e:
+        return [e]
     
 
 
