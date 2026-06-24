@@ -36,7 +36,7 @@ def minha_funcao_original(api_key,modelo,CONTEXTO_CLASSIFICACAO,texto):
 
     except Exception as e:
 
-        return False, e
+        return False, f"{e}"
     
 def bridge(url, token):
     headers = {"Authorization": f"Basic {token}"}
