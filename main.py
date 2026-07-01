@@ -53,6 +53,8 @@ def bridge(url, token):
     except Exception as e:
         return [e]
     
+def check_health():
+    return {"status": "ok","description":"Api check health"}
 
 
 
@@ -78,3 +80,12 @@ def executar_bridge(url,token, credentials: HTTPAuthorizationCredentials = Secur
     
     resultado = bridge(url,token)
     return {"resultado": resultado}
+
+@app.get("/check_health"):
+def check_health_api(credentials: HTTPAuthorizationCredentials = Security(security)):
+    if credentials.credentials != API_SECRET_TOKEN:
+        raise HTTPException(
+            status_code = 401,
+            detail="Access Denied"
+        )
+    return {check_health()}
