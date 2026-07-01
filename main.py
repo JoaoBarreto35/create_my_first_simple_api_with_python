@@ -81,11 +81,11 @@ def executar_bridge(url,token, credentials: HTTPAuthorizationCredentials = Secur
     resultado = bridge(url,token)
     return {"resultado": resultado}
 
-@app.get("/check_health"):
+@app.get("/check_health")
 def check_health_api(credentials: HTTPAuthorizationCredentials = Security(security)):
     if credentials.credentials != API_SECRET_TOKEN:
         raise HTTPException(
             status_code = 401,
             detail="Access Denied"
         )
-    return {check_health()}
+    return check_health()
