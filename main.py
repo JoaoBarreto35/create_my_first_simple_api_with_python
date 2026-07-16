@@ -42,7 +42,7 @@ def bridge(url, token):
     headers = {"Authorization": f"Basic {token}"}
 
     try:
-        response = requests.get(url, headers=headers, timeout=20)
+        response = requests.get(url, headers=headers, timeout=120)
         if response.status_code == 200:
             data = response.json().get("data", [])
             return data
@@ -50,8 +50,10 @@ def bridge(url, token):
             return []
         else:
             return []
+    except requests.exceptions.Timeout:
+        return {"error": "timeout", "detail": "Fracttal não respondeu em 120s"}
     except Exception as e:
-        return [e]
+        return {"error": "exception", "detail": str(e)}
     
 def check_health():
     return {"status": "ok","description":"Api check health"}
