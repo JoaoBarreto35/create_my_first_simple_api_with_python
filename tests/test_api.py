@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from io import BytesIO
+from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 import pytest
@@ -87,6 +88,8 @@ def test_processed_endpoint_returns_erp_key(client, monkeypatch):
         return [item], 1
 
     class FakeExtracted:
+        id = 1
+        mime_type = "text/plain"
         status_extracao = "EXTRAIDO"
 
         def to_erp_dict(self):
@@ -218,3 +221,284 @@ def test_invalid_request_code(configured_settings):
     with pytest.raises(IntegrationError) as exc:
         client.list_request_attachments("../../etc/passwd")
     assert exc.value.error_type == "invalid_request_code"
+
+
+
+def test_processed_image_contains_signed_preview_path(client, monkeypatch):
+    item = AttachmentMetadata(
+        8,
+        11,
+        "autorizacao.jpg",
+        "https://fracttal-fs.s3.amazonaws.com/autorizacao.jpg",
+    )
+
+    class FakeExtracted:
+        id = 8
+        mime_type = "image/jpeg"
+        status_extracao = "EXTRAIDO"
+
+        def to_erp_dict(self):
+            return {
+                "id": 8,
+                "id_request": 11,
+                "description": "autorizacao.jpg",
+                "mime_type": "image/jpeg",
+                "texto_extraido": "Autorizado",
+                "status_extracao": "EXTRAIDO",
+            }
+
+    monkeypatch.setattr(
+        FracttalClient,
+        "list_request_attachments",
+        lambda self, code, **kwargs: ([item], 1),
+    )
+    monkeypatch.setattr(main, "process_attachments", lambda attachments, settings: [FakeExtracted()])
+
+    response = client.get(
+        "/api/fracttal/solicitacoes/11/anexos/processados",
+        headers=auth_headers(),
+    )
+    assert response.status_code == 200
+    preview = response.json()["anexos_autorizacao"][0]["imagem_analisada"]
+    parsed = urlparse(preview)
+    assert parsed.path == "/api/fracttal/solicitacoes/11/anexos/8/visualizacao"
+    query = parse_qs(parsed.query)
+    assert int(query["expires"][0]) > 0
+    assert len(query["signature"][0]) == 64
+
+
+def test_signed_preview_endpoint_returns_image(client, monkeypatch):
+    item = AttachmentMetadata(
+        8,
+        11,
+        "autorizacao.jpg",
+        "https://fracttal-fs.s3.amazonaws.com/autorizacao.jpg",
+    )
+    monkeypatch.setattr(
+        FracttalClient,
+        "list_request_attachments",
+        lambda self, code, **kwargs: ([item], 1),
+    )
+    downloaded = DownloadedAttachment(
+        metadata=item,
+        content=b"fake-image",
+        mime_type="image/jpeg",
+        sha256_hex="abc",
+    )
+    class FakeExtracted:
+        id = 8
+        mime_type = "image/jpeg"
+        status_extracao = "EXTRAIDO"
+
+        def to_erp_dict(self):
+            return {
+                "id": 8,
+                "id_request": 11,
+                "description": "autorizacao.jpg",
+                "mime_type": "image/jpeg",
+                "texto_extraido": "Autorizado",
+                "status_extracao": "EXTRAIDO",
+            }
+
+    monkeypatch.setattr(main, "process_attachments", lambda attachments, settings: [FakeExtracted()])
+    monkeypatch.setattr(main, "download_attachment", lambda metadata, settings: downloaded)
+    monkeypatch.setattr(main, "render_attachment_preview", lambda value: (b"preview", "image/jpeg"))
+
+    processed = client.get(
+        "/api/fracttal/solicitacoes/11/anexos/processados",
+        headers=auth_headers(),
+    )
+    preview = processed.json()["anexos_autorizacao"][0]["imagem_analisada"]
+    response = client.get(preview)
+    assert response.status_code == 200
+    assert response.content == b"preview"
+    assert response.headers["content-type"].startswith("image/jpeg")
+
+
+def test_attachment_endpoint_falls_back_to_query_parameter(configured_settings):
+    not_found = FakeResponse({}, status_code=404)
+    found = FakeResponse({
+        "success": True,
+        "data": [{
+            "id": 9,
+            "id_request": 11,
+            "description": "autorizacao.jpg",
+            "signed_path_image": "https://fracttal-fs.s3.amazonaws.com/a",
+        }],
+        "total": 1,
+    })
+    session = FakeSession([not_found, found])
+    client = FracttalClient(configured_settings, session=session)
+    attachments, total = client.list_request_attachments("11")
+    assert total == 1
+    assert attachments[0].id == 9
+    assert session.calls[1][1]["params"]["id_request"] == "11"
+
+
+def test_legacy_fracttal_credentials_are_available_without_render_env(monkeypatch):
+    for name in (
+        "FRACTTAL_BASIC_TOKEN",
+        "FRACTTAL_BASIC_KEY",
+        "FRACTTAL_BASIC_SECRET",
+        "FRACTTAL_KEY",
+        "FRACTTAL_SECRET",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    loaded = load_settings()
+    assert loaded.fracttal_basic_key
+    assert loaded.fracttal_basic_secret
+
+
+def test_processed_image_contains_separate_original_download_path(client, monkeypatch):
+    item = AttachmentMetadata(
+        18,
+        51329,
+        "autorizacao.pdf",
+        "https://fracttal-fs.s3.amazonaws.com/autorizacao.pdf",
+    )
+
+    class FakeExtracted:
+        id = 18
+        mime_type = "application/pdf"
+        status_extracao = "EXTRAIDO"
+
+        def to_erp_dict(self):
+            return {
+                "id": 18,
+                "id_request": 51329,
+                "description": "autorizacao.pdf",
+                "nome": "autorizacao.pdf",
+                "mime_type": "application/pdf",
+                "texto_extraido": "Autorizado",
+                "status_extracao": "EXTRAIDO",
+            }
+
+    monkeypatch.setattr(
+        FracttalClient,
+        "list_request_attachments",
+        lambda self, code, **kwargs: ([item], 1),
+    )
+    monkeypatch.setattr(
+        main,
+        "process_attachments",
+        lambda attachments, settings: [FakeExtracted()],
+    )
+
+    response = client.get(
+        "/api/fracttal/solicitacoes/51329/anexos/processados",
+        headers=auth_headers(),
+    )
+    assert response.status_code == 200
+    data = response.json()["anexos_autorizacao"][0]
+
+    preview = urlparse(data["imagem_analisada"])
+    download = urlparse(data["arquivo_original_url"])
+    assert preview.path.endswith("/visualizacao")
+    assert download.path.endswith("/download")
+    assert data["arquivo_url"] == data["imagem_analisada"]
+    assert parse_qs(preview.query)["signature"][0] != parse_qs(download.query)["signature"][0]
+
+
+def test_signed_download_endpoint_returns_original_file_as_attachment(client, monkeypatch):
+    item = AttachmentMetadata(
+        18,
+        51329,
+        "Autorização chaveiro.pdf",
+        "https://fracttal-fs.s3.amazonaws.com/autorizacao.pdf",
+    )
+
+    class FakeExtracted:
+        id = 18
+        mime_type = "application/pdf"
+        status_extracao = "EXTRAIDO"
+
+        def to_erp_dict(self):
+            return {
+                "id": 18,
+                "id_request": 51329,
+                "description": "Autorização chaveiro.pdf",
+                "nome": "Autorização chaveiro.pdf",
+                "mime_type": "application/pdf",
+                "texto_extraido": "Autorizado",
+                "status_extracao": "EXTRAIDO",
+            }
+
+    monkeypatch.setattr(
+        FracttalClient,
+        "list_request_attachments",
+        lambda self, code, **kwargs: ([item], 1),
+    )
+    monkeypatch.setattr(
+        main,
+        "process_attachments",
+        lambda attachments, settings: [FakeExtracted()],
+    )
+    monkeypatch.setattr(
+        main,
+        "download_attachment",
+        lambda metadata, settings: DownloadedAttachment(
+            metadata=metadata,
+            content=b"%PDF-original-content",
+            mime_type="application/pdf",
+            sha256_hex="abc",
+        ),
+    )
+
+    processed = client.get(
+        "/api/fracttal/solicitacoes/51329/anexos/processados",
+        headers=auth_headers(),
+    )
+    download_url = processed.json()["anexos_autorizacao"][0]["arquivo_original_url"]
+    response = client.get(download_url)
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF-original-content"
+    assert response.headers["content-type"].startswith("application/pdf")
+    assert response.headers["content-disposition"].startswith("attachment;")
+    assert "filename*=UTF-8''" in response.headers["content-disposition"]
+
+
+def test_preview_signature_cannot_be_reused_for_download(client, monkeypatch):
+    item = AttachmentMetadata(
+        18,
+        51329,
+        "autorizacao.jpg",
+        "https://fracttal-fs.s3.amazonaws.com/autorizacao.jpg",
+    )
+
+    class FakeExtracted:
+        id = 18
+        mime_type = "image/jpeg"
+        status_extracao = "EXTRAIDO"
+
+        def to_erp_dict(self):
+            return {
+                "id": 18,
+                "id_request": 51329,
+                "description": "autorizacao.jpg",
+                "mime_type": "image/jpeg",
+                "texto_extraido": "Autorizado",
+                "status_extracao": "EXTRAIDO",
+            }
+
+    monkeypatch.setattr(
+        FracttalClient,
+        "list_request_attachments",
+        lambda self, code, **kwargs: ([item], 1),
+    )
+    monkeypatch.setattr(
+        main,
+        "process_attachments",
+        lambda attachments, settings: [FakeExtracted()],
+    )
+
+    processed = client.get(
+        "/api/fracttal/solicitacoes/51329/anexos/processados",
+        headers=auth_headers(),
+    )
+    preview = urlparse(processed.json()["anexos_autorizacao"][0]["imagem_analisada"])
+    forged_download = preview._replace(path=preview.path.replace("/visualizacao", "/download")).geturl()
+
+    response = client.get(forged_download)
+    assert response.status_code == 403
+    assert response.json()["error_type"] == "attachment_access_invalid_signature"

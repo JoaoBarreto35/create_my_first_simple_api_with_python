@@ -369,6 +369,41 @@ def extract_attachment(downloaded: DownloadedAttachment, settings: Settings) -> 
     )
 
 
+
+def render_attachment_preview(downloaded: DownloadedAttachment) -> tuple[bytes, str]:
+    """Retorna uma imagem exibível pelo frontend para fotos e PDFs.
+
+    Imagens são preservadas sem recodificação. Para PDFs, somente a primeira
+    página é renderizada em PNG, suficiente para a conferência visual solicitada
+    pelo ERP sem alterar o conteúdo usado na extração documental.
+    """
+    if downloaded.mime_type in _IMAGE_MIMES:
+        return downloaded.content, downloaded.mime_type
+    if downloaded.mime_type == "application/pdf":
+        try:
+            import pymupdf
+
+            document = pymupdf.open(stream=downloaded.content, filetype="pdf")
+            try:
+                if document.page_count < 1:
+                    raise ValueError("PDF sem páginas")
+                page = document.load_page(0)
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(1.6, 1.6), alpha=False)
+                return pixmap.tobytes("png"), "image/png"
+            finally:
+                document.close()
+        except Exception as exc:
+            raise IntegrationError(
+                "attachment_preview_unavailable",
+                "Não foi possível gerar a visualização da primeira página do PDF.",
+                status_code=422,
+            ) from exc
+    raise IntegrationError(
+        "attachment_preview_unsupported",
+        "O formato deste anexo não possui visualização de imagem disponível.",
+        status_code=415,
+    )
+
 def process_attachment(metadata: AttachmentMetadata, settings: Settings) -> ExtractedAttachment:
     try:
         downloaded = download_attachment(metadata, settings)

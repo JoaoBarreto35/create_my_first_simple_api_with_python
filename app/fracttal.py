@@ -69,6 +69,113 @@ class FracttalClient:
             )
         return normalized
 
+    def _get(self, url: str, params: dict[str, Any]) -> requests.Response:
+        try:
+            return self.session.get(
+                url,
+                headers={"Authorization": self._authorization_value()},
+                params=params,
+                timeout=(self.settings.connect_timeout, self.settings.read_timeout),
+            )
+        except requests.Timeout as exc:
+            raise IntegrationError(
+                "fracttal_timeout",
+                "O Fracttal não respondeu a tempo ao consultar anexos.",
+            ) from exc
+        except requests.RequestException as exc:
+            raise IntegrationError(
+                "fracttal_connection_error",
+                "Não foi possível conectar à API do Fracttal.",
+            ) from exc
+
+    @staticmethod
+    def _decode_payload(response: requests.Response) -> dict[str, Any]:
+        if response.status_code in (401, 403):
+            raise IntegrationError(
+                "fracttal_authentication_error",
+                "O Fracttal recusou as credenciais da API central.",
+                upstream_status=response.status_code,
+            )
+        if response.status_code >= 400:
+            raise IntegrationError(
+                "fracttal_upstream_error",
+                "O Fracttal retornou erro ao consultar anexos.",
+                upstream_status=response.status_code,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise IntegrationError(
+                "fracttal_invalid_json",
+                "O Fracttal retornou uma resposta que não é JSON válido.",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise IntegrationError(
+                "fracttal_invalid_payload",
+                "O formato da resposta de anexos do Fracttal é inválido.",
+            )
+        if payload.get("success") is False:
+            raise IntegrationError(
+                "fracttal_rejected_request",
+                str(payload.get("message") or "O Fracttal recusou a consulta de anexos."),
+            )
+        return payload
+
+    def _resolve_request_id(self, code: str) -> int | None:
+        """Resolve o ID interno quando o endpoint de anexos não aceita o code.
+
+        Algumas instalações do Fracttal expõem anexos pelo ID interno da
+        solicitação, enquanto o ERP trabalha com ``id_code``/``code``. A busca
+        só é executada como fallback após HTTP 404, preservando o fluxo atual.
+        """
+        url = f"{self.settings.fracttal_base_url}/work_requests/"
+        for field in ("id_code", "code"):
+            response = self._get(url, {field: code, "start": 0, "limit": 100})
+            if response.status_code == 404:
+                continue
+            payload = self._decode_payload(response)
+            data = payload.get("data") or []
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                visible_code = item.get("code", item.get("id_code"))
+                if str(visible_code or "").strip() != code:
+                    continue
+                for key in ("id", "id_request", "id_work_request"):
+                    try:
+                        value = int(item.get(key))
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        return value
+        return None
+
+    def _attachments_response(
+        self,
+        identifier: str | int,
+        *,
+        cursor: int,
+        limit: int,
+    ) -> requests.Response:
+        """Consulta anexos aceitando as duas formas conhecidas do endpoint."""
+        encoded = quote(str(identifier), safe="")
+        path_url = f"{self.settings.fracttal_base_url}/work_requests_attachments/{encoded}"
+        response = self._get(path_url, {"start": cursor, "limit": limit})
+        if response.status_code != 404:
+            return response
+
+        query_url = f"{self.settings.fracttal_base_url}/work_requests_attachments/"
+        for field in ("id_request", "id_work_request"):
+            response = self._get(
+                query_url,
+                {field: identifier, "start": cursor, "limit": limit},
+            )
+            if response.status_code != 404:
+                return response
+        return response
+
     def list_request_attachments(
         self,
         code: str,
@@ -80,74 +187,38 @@ class FracttalClient:
         code = self._validate_code(code)
         start = max(0, int(start))
         limit = max(1, min(100, int(limit)))
-        url = (
-            f"{self.settings.fracttal_base_url}/"
-            f"work_requests_attachments/{quote(code, safe='')}"
-        )
-        headers = {"Authorization": self._authorization_value()}
         collected: list[AttachmentMetadata] = []
         seen_ids: set[int] = set()
         source_total = 0
         cursor = start
+        identifier: str | int = code
+        request_exists = False
+        resolved_once = False
 
         for _page in range(self.settings.max_pages):
-            try:
-                response = self.session.get(
-                    url,
-                    headers=headers,
-                    params={"start": cursor, "limit": limit},
-                    timeout=(self.settings.connect_timeout, self.settings.read_timeout),
-                )
-            except requests.Timeout as exc:
-                raise IntegrationError(
-                    "fracttal_timeout",
-                    "O Fracttal não respondeu a tempo ao consultar anexos.",
-                ) from exc
-            except requests.RequestException as exc:
-                raise IntegrationError(
-                    "fracttal_connection_error",
-                    "Não foi possível conectar à API do Fracttal.",
-                ) from exc
-
-            if response.status_code in (401, 403):
-                raise IntegrationError(
-                    "fracttal_authentication_error",
-                    "O Fracttal recusou as credenciais da API central.",
-                    upstream_status=response.status_code,
-                )
+            response = self._attachments_response(identifier, cursor=cursor, limit=limit)
+            if response.status_code == 404 and not resolved_once:
+                resolved_once = True
+                resolved_id = self._resolve_request_id(code)
+                if resolved_id is not None:
+                    request_exists = True
+                    identifier = resolved_id
+                    response = self._attachments_response(
+                        identifier,
+                        cursor=cursor,
+                        limit=limit,
+                    )
             if response.status_code == 404:
+                if request_exists:
+                    return [], 0
                 raise IntegrationError(
                     "fracttal_request_not_found",
                     "A solicitação informada não foi localizada no Fracttal.",
                     status_code=404,
                     upstream_status=404,
                 )
-            if response.status_code >= 400:
-                raise IntegrationError(
-                    "fracttal_upstream_error",
-                    "O Fracttal retornou erro ao consultar anexos.",
-                    upstream_status=response.status_code,
-                )
 
-            try:
-                payload = response.json()
-            except ValueError as exc:
-                raise IntegrationError(
-                    "fracttal_invalid_json",
-                    "O Fracttal retornou uma resposta que não é JSON válido.",
-                ) from exc
-
-            if not isinstance(payload, dict):
-                raise IntegrationError(
-                    "fracttal_invalid_payload",
-                    "O formato da resposta de anexos do Fracttal é inválido.",
-                )
-            if payload.get("success") is False:
-                raise IntegrationError(
-                    "fracttal_rejected_request",
-                    str(payload.get("message") or "O Fracttal recusou a consulta de anexos."),
-                )
-
+            payload = self._decode_payload(response)
             raw_data = payload.get("data", [])
             if raw_data is None:
                 raw_data = []
@@ -161,17 +232,34 @@ class FracttalClient:
             except (TypeError, ValueError):
                 source_total = max(source_total, len(raw_data))
 
-            valid_in_page = 0
             for item in raw_data:
                 if not isinstance(item, dict):
                     continue
                 try:
                     attachment_id = int(item.get("id"))
-                    request_id = int(item.get("id_request"))
                 except (TypeError, ValueError):
                     continue
-                signed_url = str(item.get("signed_path_image") or "").strip()
-                description = str(item.get("description") or f"anexo-{attachment_id}").strip()
+                try:
+                    request_id = int(
+                        item.get("id_request")
+                        or item.get("id_work_request")
+                        or identifier
+                    )
+                except (TypeError, ValueError):
+                    request_id = 0
+                signed_url = str(
+                    item.get("signed_path_image")
+                    or item.get("path_image")
+                    or item.get("download_url")
+                    or item.get("url")
+                    or ""
+                ).strip()
+                description = str(
+                    item.get("description")
+                    or item.get("file_name")
+                    or item.get("name")
+                    or f"anexo-{attachment_id}"
+                ).strip()
                 if attachment_id in seen_ids:
                     continue
                 seen_ids.add(attachment_id)
@@ -183,7 +271,6 @@ class FracttalClient:
                         signed_url=signed_url,
                     )
                 )
-                valid_in_page += 1
                 if len(collected) >= self.settings.max_attachments:
                     return collected, source_total
 
@@ -194,7 +281,5 @@ class FracttalClient:
             if len(raw_data) < limit:
                 break
             cursor += len(raw_data)
-            if valid_in_page == 0 and not raw_data:
-                break
 
         return collected, source_total
