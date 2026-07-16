@@ -14,6 +14,48 @@ from .http import build_session
 from .settings import Settings
 
 _CODE_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_BASIC_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def normalize_fracttal_authorization(value: str | None) -> str | None:
+    """Normaliza uma credencial Basic recebida do ERP.
+
+    O header é opcional. Quando presente, ele prevalece somente nesta chamada e
+    nunca é persistido em arquivo ou variável de ambiente.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if len(raw) > 4096 or "\r" in raw or "\n" in raw:
+        raise IntegrationError(
+            "invalid_fracttal_authorization",
+            "A credencial do Fracttal recebida pelo ERP possui formato inválido.",
+            status_code=422,
+        )
+    token = raw[6:].strip() if raw.lower().startswith("basic ") else raw
+    if not token or not _BASIC_TOKEN_RE.fullmatch(token):
+        raise IntegrationError(
+            "invalid_fracttal_authorization",
+            "A credencial do Fracttal recebida pelo ERP possui formato inválido.",
+            status_code=422,
+        )
+    try:
+        decoded = base64.b64decode(token, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise IntegrationError(
+            "invalid_fracttal_authorization",
+            "A credencial do Fracttal recebida pelo ERP possui formato inválido.",
+            status_code=422,
+        ) from exc
+    if b":" not in decoded:
+        raise IntegrationError(
+            "invalid_fracttal_authorization",
+            "A credencial do Fracttal recebida pelo ERP possui formato inválido.",
+            status_code=422,
+        )
+    return f"Basic {token}"
 
 
 @dataclass(frozen=True)
@@ -36,14 +78,24 @@ class AttachmentMetadata:
 
 
 class FracttalClient:
-    def __init__(self, settings: Settings, session: requests.Session | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        session: requests.Session | None = None,
+        authorization_override: str | None = None,
+    ):
         self.settings = settings
         self.session = session or build_session(settings)
+        self.authorization_override = normalize_fracttal_authorization(
+            authorization_override
+        )
 
     def close(self) -> None:
         self.session.close()
 
     def _authorization_value(self) -> str:
+        if self.authorization_override:
+            return self.authorization_override
         token = (self.settings.fracttal_basic_token or "").strip()
         if token:
             return token if token.lower().startswith("basic ") else f"Basic {token}"

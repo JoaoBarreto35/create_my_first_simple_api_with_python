@@ -18,10 +18,12 @@ integração com ausência real de anexos.
 
 import os
 from pathlib import PurePath
+from threading import RLock
+import time
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query, Request, Security
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Security
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import requests
@@ -32,7 +34,7 @@ from app.documents import (
     render_attachment_preview,
 )
 from app.errors import IntegrationError
-from app.fracttal import FracttalClient
+from app.fracttal import FracttalClient, normalize_fracttal_authorization
 from app.http import build_session
 from app.preview import (
     build_download_path,
@@ -45,6 +47,64 @@ from app.settings import Settings, load_settings
 
 settings: Settings = load_settings()
 security = HTTPBearer(auto_error=False)
+
+
+
+# O componente de imagem do ERP acessa as URLs assinadas sem headers próprios.
+# Quando o endpoint processado recebe a credencial do Fracttal do ERP, ela é
+# mantida somente em memória durante o mesmo prazo da URL temporária, permitindo
+# que a prévia e o download reutilizem a autenticação sem qualquer ajuste no
+# Render e sem expor a credencial na URL.
+_ATTACHMENT_AUTH_CACHE: dict[tuple[str, int], tuple[int, str]] = {}
+_ATTACHMENT_AUTH_CACHE_LOCK = RLock()
+_ATTACHMENT_AUTH_CACHE_MAX_ITEMS = 1000
+
+
+def _remember_attachment_authorization(
+    code: str,
+    attachment_ids: list[int],
+    authorization: str | None,
+) -> None:
+    normalized = normalize_fracttal_authorization(authorization)
+    if not normalized or not attachment_ids:
+        return
+    now = int(time.time())
+    expires = now + settings.attachment_preview_ttl_seconds
+    with _ATTACHMENT_AUTH_CACHE_LOCK:
+        expired = [
+            key for key, (item_expires, _value) in _ATTACHMENT_AUTH_CACHE.items()
+            if item_expires < now
+        ]
+        for key in expired:
+            _ATTACHMENT_AUTH_CACHE.pop(key, None)
+        for attachment_id in attachment_ids:
+            _ATTACHMENT_AUTH_CACHE[(str(code), int(attachment_id))] = (
+                expires,
+                normalized,
+            )
+        if len(_ATTACHMENT_AUTH_CACHE) > _ATTACHMENT_AUTH_CACHE_MAX_ITEMS:
+            oldest = sorted(
+                _ATTACHMENT_AUTH_CACHE.items(),
+                key=lambda item: item[1][0],
+            )
+            excess = len(_ATTACHMENT_AUTH_CACHE) - _ATTACHMENT_AUTH_CACHE_MAX_ITEMS
+            for key, _value in oldest[:excess]:
+                _ATTACHMENT_AUTH_CACHE.pop(key, None)
+
+
+def _attachment_authorization(code: str, attachment_id: int) -> str | None:
+    now = int(time.time())
+    key = (str(code), int(attachment_id))
+    with _ATTACHMENT_AUTH_CACHE_LOCK:
+        cached = _ATTACHMENT_AUTH_CACHE.get(key)
+        if cached is None:
+            return None
+        expires, authorization = cached
+        if expires < now:
+            _ATTACHMENT_AUTH_CACHE.pop(key, None)
+            return None
+        return authorization
+
 
 app = FastAPI(
     title="ERP Manutenção — API Central",
@@ -194,6 +254,9 @@ def consultar_anexos_solicitacao(
     limit: int = Query(100, ge=1, le=100),
     paginate_all: bool = Query(True),
     include_signed_url: bool = Query(False),
+    fracttal_authorization: str | None = Header(
+        None, alias="X-Fracttal-Authorization"
+    ),
     credentials: HTTPAuthorizationCredentials | None = Security(security),
 ):
     """Consulta metadados dos anexos de uma solicitação.
@@ -203,7 +266,9 @@ def consultar_anexos_solicitacao(
     metadados e status de extração necessários ao ERP.
     """
     _authorize(credentials)
-    client = FracttalClient(settings)
+    client = FracttalClient(
+        settings, authorization_override=fracttal_authorization
+    )
     try:
         attachments, source_total = client.list_request_attachments(
             code,
@@ -230,6 +295,9 @@ def consultar_anexos_solicitacao(
 )
 def processar_anexos_solicitacao(
     code: str,
+    fracttal_authorization: str | None = Header(
+        None, alias="X-Fracttal-Authorization"
+    ),
     credentials: HTTPAuthorizationCredentials | None = Security(security),
 ):
     """Baixa e extrai os anexos para a validação documental no ERP.
@@ -240,7 +308,9 @@ def processar_anexos_solicitacao(
     lista vazia enganosa.
     """
     _authorize(credentials)
-    client = FracttalClient(settings)
+    client = FracttalClient(
+        settings, authorization_override=fracttal_authorization
+    )
     try:
         attachments, source_total = client.list_request_attachments(
             code,
@@ -250,6 +320,11 @@ def processar_anexos_solicitacao(
         )
     finally:
         client.close()
+    _remember_attachment_authorization(
+        code,
+        [item.id for item in attachments],
+        fracttal_authorization,
+    )
     extracted = process_attachments(attachments, settings)
     payload = [item.to_erp_dict() for item in extracted]
     metadata_by_id = {item.id: item for item in attachments}
@@ -301,7 +376,10 @@ def _safe_download_filename(description: str, attachment_id: int) -> str:
 
 
 def _locate_and_download_attachment(code: str, attachment_id: int):
-    client = FracttalClient(settings)
+    client = FracttalClient(
+        settings,
+        authorization_override=_attachment_authorization(code, attachment_id),
+    )
     try:
         attachments, _source_total = client.list_request_attachments(
             code, start=0, limit=100, paginate_all=True
