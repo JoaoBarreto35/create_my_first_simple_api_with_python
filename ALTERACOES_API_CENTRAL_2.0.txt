@@ -1,0 +1,21 @@
+API CENTRAL 2.0 — INTEGRAÇÃO DE ANEXOS DO FRACTTAL
+
+- Endpoints legados /api/bridge, /api/executar e /check_health preservados.
+- Bridge genérico restrito ao domínio HTTPS oficial do Fracttal.
+- Novo endpoint de metadados de anexos por code da solicitação.
+- Novo endpoint de processamento compatível com anexos_autorizacao do ERP_22.
+- Paginação automática de até 100 registros por página.
+- Erros de autenticação, rede, JSON e payload diferenciados de lista vazia.
+- Credenciais do Fracttal lidas do ambiente do Render.
+- Download seguro das URLs assinadas, com allowlist de hosts, HTTPS, limite de
+  redirecionamento, limite de tamanho, hash SHA-256 e detecção do tipo real.
+- Extração local de PDF textual, DOCX e TXT.
+- OCR opcional com Gemini para imagens e PDFs escaneados, apenas como
+  transcrição, sem decisão de autorização.
+- Processamento concorrente limitado a no máximo quatro anexos.
+- Headers de segurança e cache desabilitado em respostas sensíveis.
+- Health check público /health sem expor segredos.
+- Access log do Uvicorn desabilitado no Render para não registrar parâmetros
+  sensíveis dos endpoints legados.
+- Testes automatizados de autenticação, paginação, contratos, lista vazia,
+  erros estruturados e extração de texto.

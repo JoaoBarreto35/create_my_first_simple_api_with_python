@@ -3,4 +3,18 @@ services:
     name: minha-api-simples
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --no-access-log
+    healthCheckPath: /health
+    envVars:
+      - key: API_SECRET_TOKEN
+        sync: false
+      - key: FRACTTAL_BASIC_KEY
+        sync: false
+      - key: FRACTTAL_BASIC_SECRET
+        sync: false
+      - key: DOCUMENT_GEMINI_API_KEY
+        sync: false
+      - key: DOCUMENT_OCR_WITH_GEMINI
+        value: "true"
+      - key: ENABLE_API_DOCS
+        value: "false"
