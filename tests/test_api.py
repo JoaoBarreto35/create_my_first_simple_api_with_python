@@ -315,26 +315,6 @@ def test_signed_preview_endpoint_returns_image(client, monkeypatch):
     assert response.headers["content-type"].startswith("image/jpeg")
 
 
-def test_attachment_endpoint_falls_back_to_query_parameter(configured_settings):
-    not_found = FakeResponse({}, status_code=404)
-    found = FakeResponse({
-        "success": True,
-        "data": [{
-            "id": 9,
-            "id_request": 11,
-            "description": "autorizacao.jpg",
-            "signed_path_image": "https://fracttal-fs.s3.amazonaws.com/a",
-        }],
-        "total": 1,
-    })
-    session = FakeSession([not_found, found])
-    client = FracttalClient(configured_settings, session=session)
-    attachments, total = client.list_request_attachments("11")
-    assert total == 1
-    assert attachments[0].id == 9
-    assert session.calls[1][1]["params"]["id_request"] == "11"
-
-
 def test_legacy_fracttal_credentials_are_available_without_render_env(monkeypatch):
     for name in (
         "FRACTTAL_BASIC_TOKEN",
@@ -608,4 +588,57 @@ def test_preview_reuses_forwarded_fracttal_header_without_render_credentials(
     assert preview.status_code == 200
     assert preview.content == b"preview"
     assert received == [f"Basic {token}", f"Basic {token}"]
+
+def test_attachment_query_uses_only_documented_code_path(configured_settings):
+    payload = {
+        "success": True,
+        "data": [{
+            "id": 9,
+            "id_request": 51329,
+            "description": "autorizacao.jpg",
+            "signed_path_image": "https://fracttal-fs.s3.amazonaws.com/a",
+        }],
+        "total": 1,
+    }
+    session = FakeSession([FakeResponse(payload)])
+    fracttal = FracttalClient(configured_settings, session=session)
+    attachments, total = fracttal.list_request_attachments("51329")
+    assert total == 1
+    assert attachments[0].id == 9
+    assert len(session.calls) == 1
+    url, kwargs = session.calls[0]
+    assert url.endswith("/work_requests_attachments/51329")
+    assert kwargs["params"] == {"start": 0, "limit": 100}
+
+
+def test_attachment_404_contains_exact_context(client, monkeypatch):
+    def fail(self, code, **kwargs):
+        raise IntegrationError(
+            "fracttal_request_not_found",
+            (
+                "ERRO DE INTEGRAÇÃO — o Fracttal respondeu HTTP 404 para o "
+                "code 51329. A solicitação não foi localizada ou o identificador "
+                "enviado não corresponde ao campo code."
+            ),
+            status_code=404,
+            upstream_status=404,
+            stage="consultar_anexos_fracttal",
+            request_code="51329",
+            endpoint="work_requests_attachments/51329",
+        )
+
+    monkeypatch.setattr(FracttalClient, "list_request_attachments", fail)
+    response = client.get(
+        "/api/fracttal/solicitacoes/51329/anexos/processados",
+        headers=auth_headers(),
+    )
+    assert response.status_code == 404
+    body = response.json()
+    assert body["success"] is False
+    assert body["stage"] == "consultar_anexos_fracttal"
+    assert body["error_type"] == "fracttal_request_not_found"
+    assert body["request_code"] == "51329"
+    assert body["fracttal_status"] == 404
+    assert body["endpoint"] == "work_requests_attachments/51329"
+    assert "campo code" in body["message"]
 

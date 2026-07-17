@@ -136,9 +136,13 @@ async def integration_error_handler(_request: Request, exc: IntegrationError):
         status_code=exc.status_code,
         content={
             "success": False,
+            "stage": exc.stage,
             "error_type": exc.error_type,
             "message": exc.message,
+            "request_code": exc.request_code,
+            "fracttal_status": exc.upstream_status,
             "upstream_status": exc.upstream_status,
+            "endpoint": exc.endpoint,
             "data": [],
         },
     )
