@@ -21,6 +21,7 @@ reduz o risco de SSRF sem alterar as consultas atuais do ERP.
 ```http
 GET /api/fracttal/solicitacoes/{code}/anexos
 Authorization: Bearer <API_SECRET_TOKEN>
+X-Fracttal-Authorization: Basic <TOKEN_BASIC_JA_USADO_PELO_ERP>
 ```
 
 Parâmetros opcionais:
@@ -38,6 +39,7 @@ segurança da API.
 ```http
 GET /api/fracttal/solicitacoes/{code}/anexos/processados
 Authorization: Bearer <API_SECRET_TOKEN>
+X-Fracttal-Authorization: Basic <TOKEN_BASIC_JA_USADO_PELO_ERP>
 ```
 
 Esse endpoint:
@@ -87,13 +89,16 @@ Exemplo resumido:
 Isso impede que uma indisponibilidade do Fracttal seja interpretada como ausência
 de autorização.
 
-## Variáveis obrigatórias no Render
+## Autenticação do Fracttal nos endpoints de anexos
 
-```text
-API_SECRET_TOKEN
-FRACTTAL_BASIC_KEY
-FRACTTAL_BASIC_SECRET
-```
+O ERP pode enviar no header `X-Fracttal-Authorization` o mesmo token Basic que
+já utiliza nas consultas normais ao Fracttal. Esse valor prevalece somente na
+requisição atual e fica temporariamente apenas em memória para permitir a
+visualização e o download pelas URLs assinadas. Assim, não é necessário alterar
+as variáveis do Render compartilhado.
+
+As configurações já existentes no Render continuam sendo usadas como fallback.
+O `API_SECRET_TOKEN` permanece obrigatório para proteger os endpoints privados.
 
 Para OCR de prints e PDFs escaneados:
 
@@ -118,8 +123,9 @@ Health: /health
 ```
 
 O acesso log foi desativado porque os endpoints legados ainda recebem
-credenciais como parâmetros de URL. Os novos endpoints especializados usam as
-credenciais armazenadas exclusivamente no ambiente do Render.
+credenciais como parâmetros de URL. Nos endpoints especializados, a credencial
+do Fracttal é recebida por header e nunca é incluída nas URLs de prévia ou de
+download.
 
 ## Desenvolvimento e testes
 
@@ -152,3 +158,16 @@ chamado["validacao_documental"] = {
 ```
 
 Essa ligação é a única etapa restante para ativar a consulta real no ERP.
+
+
+## Visualização e download do anexo
+
+Para imagens e PDFs processados, cada item retorna:
+
+- `imagem_analisada`: URL temporária para visualização rápida no ERP;
+- `arquivo_url`: alias legado da mesma prévia, preservado por compatibilidade;
+- `arquivo_original_url`: URL temporária exclusiva para download do arquivo original.
+
+A rota de visualização responde com `Content-Disposition: inline`. A rota do
+arquivo original responde com `Content-Disposition: attachment`, portanto não
+há download automático ao abrir a prévia.

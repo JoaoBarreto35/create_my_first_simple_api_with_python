@@ -17,9 +17,13 @@ integração com ausência real de anexos.
 """
 
 import os
+from pathlib import PurePath
+from threading import RLock
+import time
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query, Request, Security
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Security
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import requests
@@ -30,18 +34,81 @@ from app.documents import (
     render_attachment_preview,
 )
 from app.errors import IntegrationError
-from app.fracttal import FracttalClient
+from app.fracttal import FracttalClient, normalize_fracttal_authorization
 from app.http import build_session
-from app.preview import build_preview_path, verify_preview
+from app.preview import (
+    build_download_path,
+    build_preview_path,
+    verify_download,
+    verify_preview,
+)
 from app.security import require_api_token, validate_fracttal_bridge_url
 from app.settings import Settings, load_settings
 
 settings: Settings = load_settings()
 security = HTTPBearer(auto_error=False)
 
+
+
+# O componente de imagem do ERP acessa as URLs assinadas sem headers próprios.
+# Quando o endpoint processado recebe a credencial do Fracttal do ERP, ela é
+# mantida somente em memória durante o mesmo prazo da URL temporária, permitindo
+# que a prévia e o download reutilizem a autenticação sem qualquer ajuste no
+# Render e sem expor a credencial na URL.
+_ATTACHMENT_AUTH_CACHE: dict[tuple[str, int], tuple[int, str]] = {}
+_ATTACHMENT_AUTH_CACHE_LOCK = RLock()
+_ATTACHMENT_AUTH_CACHE_MAX_ITEMS = 1000
+
+
+def _remember_attachment_authorization(
+    code: str,
+    attachment_ids: list[int],
+    authorization: str | None,
+) -> None:
+    normalized = normalize_fracttal_authorization(authorization)
+    if not normalized or not attachment_ids:
+        return
+    now = int(time.time())
+    expires = now + settings.attachment_preview_ttl_seconds
+    with _ATTACHMENT_AUTH_CACHE_LOCK:
+        expired = [
+            key for key, (item_expires, _value) in _ATTACHMENT_AUTH_CACHE.items()
+            if item_expires < now
+        ]
+        for key in expired:
+            _ATTACHMENT_AUTH_CACHE.pop(key, None)
+        for attachment_id in attachment_ids:
+            _ATTACHMENT_AUTH_CACHE[(str(code), int(attachment_id))] = (
+                expires,
+                normalized,
+            )
+        if len(_ATTACHMENT_AUTH_CACHE) > _ATTACHMENT_AUTH_CACHE_MAX_ITEMS:
+            oldest = sorted(
+                _ATTACHMENT_AUTH_CACHE.items(),
+                key=lambda item: item[1][0],
+            )
+            excess = len(_ATTACHMENT_AUTH_CACHE) - _ATTACHMENT_AUTH_CACHE_MAX_ITEMS
+            for key, _value in oldest[:excess]:
+                _ATTACHMENT_AUTH_CACHE.pop(key, None)
+
+
+def _attachment_authorization(code: str, attachment_id: int) -> str | None:
+    now = int(time.time())
+    key = (str(code), int(attachment_id))
+    with _ATTACHMENT_AUTH_CACHE_LOCK:
+        cached = _ATTACHMENT_AUTH_CACHE.get(key)
+        if cached is None:
+            return None
+        expires, authorization = cached
+        if expires < now:
+            _ATTACHMENT_AUTH_CACHE.pop(key, None)
+            return None
+        return authorization
+
+
 app = FastAPI(
     title="ERP Manutenção — API Central",
-    version="2.0.1",
+    version="2.0.2",
     docs_url="/docs" if settings.enable_docs else None,
     redoc_url="/redoc" if settings.enable_docs else None,
     openapi_url="/openapi.json" if settings.enable_docs else None,
@@ -69,9 +136,13 @@ async def integration_error_handler(_request: Request, exc: IntegrationError):
         status_code=exc.status_code,
         content={
             "success": False,
+            "stage": exc.stage,
             "error_type": exc.error_type,
             "message": exc.message,
+            "request_code": exc.request_code,
+            "fracttal_status": exc.upstream_status,
             "upstream_status": exc.upstream_status,
+            "endpoint": exc.endpoint,
             "data": [],
         },
     )
@@ -135,7 +206,7 @@ def _legacy_bridge(url: str, token: str) -> list[Any]:
 @app.get("/health")
 def public_health() -> dict[str, str]:
     """Health check público, sem segredos ou acesso a integrações externas."""
-    return {"status": "ok", "service": "erp-central-api", "version": "2.0.1"}
+    return {"status": "ok", "service": "erp-central-api", "version": "2.0.2"}
 
 
 @app.get("/check_health")
@@ -143,7 +214,7 @@ def check_health_api(
     credentials: HTTPAuthorizationCredentials | None = Security(security),
 ):
     _authorize(credentials)
-    return {"status": "ok", "description": "Api check health", "version": "2.0.1"}
+    return {"status": "ok", "description": "Api check health", "version": "2.0.2"}
 
 
 @app.get("/api/executar")
@@ -187,6 +258,9 @@ def consultar_anexos_solicitacao(
     limit: int = Query(100, ge=1, le=100),
     paginate_all: bool = Query(True),
     include_signed_url: bool = Query(False),
+    fracttal_authorization: str | None = Header(
+        None, alias="X-Fracttal-Authorization"
+    ),
     credentials: HTTPAuthorizationCredentials | None = Security(security),
 ):
     """Consulta metadados dos anexos de uma solicitação.
@@ -196,7 +270,9 @@ def consultar_anexos_solicitacao(
     metadados e status de extração necessários ao ERP.
     """
     _authorize(credentials)
-    client = FracttalClient(settings)
+    client = FracttalClient(
+        settings, authorization_override=fracttal_authorization
+    )
     try:
         attachments, source_total = client.list_request_attachments(
             code,
@@ -223,6 +299,9 @@ def consultar_anexos_solicitacao(
 )
 def processar_anexos_solicitacao(
     code: str,
+    fracttal_authorization: str | None = Header(
+        None, alias="X-Fracttal-Authorization"
+    ),
     credentials: HTTPAuthorizationCredentials | None = Security(security),
 ):
     """Baixa e extrai os anexos para a validação documental no ERP.
@@ -233,7 +312,9 @@ def processar_anexos_solicitacao(
     lista vazia enganosa.
     """
     _authorize(credentials)
-    client = FracttalClient(settings)
+    client = FracttalClient(
+        settings, authorization_override=fracttal_authorization
+    )
     try:
         attachments, source_total = client.list_request_attachments(
             code,
@@ -243,6 +324,11 @@ def processar_anexos_solicitacao(
         )
     finally:
         client.close()
+    _remember_attachment_authorization(
+        code,
+        [item.id for item in attachments],
+        fracttal_authorization,
+    )
     extracted = process_attachments(attachments, settings)
     payload = [item.to_erp_dict() for item in extracted]
     metadata_by_id = {item.id: item for item in attachments}
@@ -252,9 +338,13 @@ def processar_anexos_solicitacao(
             continue
         if item.mime_type.startswith("image/") or item.mime_type == "application/pdf":
             preview_path = build_preview_path(code, item.id, settings)
-            # O ERP já reconhece estes campos e os converte em URL absoluta.
+            download_path = build_download_path(code, item.id, settings)
+            # Mantém os campos já reconhecidos pelo ERP para a visualização.
             data["imagem_analisada"] = preview_path
             data["arquivo_url"] = preview_path
+            # Campo novo e separado para o futuro botão de download do original.
+            # O ERP atual não interpreta este campo como uma segunda imagem.
+            data["arquivo_original_url"] = download_path
     extracted_count = sum(1 for item in extracted if item.status_extracao == "EXTRAIDO")
     error_count = sum(1 for item in extracted if item.status_extracao == "ERRO_INTEGRACAO")
     manual_count = len(extracted) - extracted_count - error_count
@@ -282,6 +372,34 @@ def processar_anexos_solicitacao(
     }
 
 
+
+
+def _safe_download_filename(description: str, attachment_id: int) -> str:
+    filename = PurePath(str(description or "")).name.replace("\x00", "").strip()
+    return (filename or f"anexo-{attachment_id}")[:255]
+
+
+def _locate_and_download_attachment(code: str, attachment_id: int):
+    client = FracttalClient(
+        settings,
+        authorization_override=_attachment_authorization(code, attachment_id),
+    )
+    try:
+        attachments, _source_total = client.list_request_attachments(
+            code, start=0, limit=100, paginate_all=True
+        )
+    finally:
+        client.close()
+    metadata = next((item for item in attachments if item.id == attachment_id), None)
+    if metadata is None:
+        raise IntegrationError(
+            "attachment_not_found",
+            "O anexo solicitado não foi localizado para esta solicitação.",
+            status_code=404,
+        )
+    return metadata, download_attachment(metadata, settings)
+
+
 @app.get(
     "/api/fracttal/solicitacoes/{code}/anexos/{attachment_id}/visualizacao",
     include_in_schema=False,
@@ -299,21 +417,7 @@ def visualizar_anexo_solicitacao(
     alterado por esta rota.
     """
     verify_preview(code, attachment_id, expires, signature, settings)
-    client = FracttalClient(settings)
-    try:
-        attachments, _source_total = client.list_request_attachments(
-            code, start=0, limit=100, paginate_all=True
-        )
-    finally:
-        client.close()
-    metadata = next((item for item in attachments if item.id == attachment_id), None)
-    if metadata is None:
-        raise IntegrationError(
-            "attachment_not_found",
-            "O anexo solicitado não foi localizado para esta solicitação.",
-            status_code=404,
-        )
-    downloaded = download_attachment(metadata, settings)
+    metadata, downloaded = _locate_and_download_attachment(code, attachment_id)
     content, media_type = render_attachment_preview(downloaded)
     return Response(
         content=content,
@@ -323,3 +427,35 @@ def visualizar_anexo_solicitacao(
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+@app.get(
+    "/api/fracttal/solicitacoes/{code}/anexos/{attachment_id}/download",
+    include_in_schema=False,
+)
+def baixar_anexo_original(
+    code: str,
+    attachment_id: int,
+    expires: int = Query(..., ge=1),
+    signature: str = Query(..., min_length=32, max_length=128),
+):
+    """Baixa o arquivo original somente quando o usuário aciona o botão próprio.
+
+    Esta rota nunca é usada pela prévia e responde com ``attachment`` para que
+    imagens e PDFs sejam baixados apenas sob ação explícita do usuário.
+    """
+    verify_download(code, attachment_id, expires, signature, settings)
+    metadata, downloaded = _locate_and_download_attachment(code, attachment_id)
+    filename = _safe_download_filename(metadata.description, attachment_id)
+    encoded_filename = quote(filename, safe="")
+    return Response(
+        content=downloaded.content,
+        media_type=downloaded.mime_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="anexo-{attachment_id}"; '
+                f"filename*=UTF-8''{encoded_filename}"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+

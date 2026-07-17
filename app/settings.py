@@ -1,12 +1,19 @@
 """Configurações da API central.
 
-Todos os segredos são lidos de variáveis de ambiente. Nenhum token do Fracttal
-precisa ser enviado pelo ERP nos endpoints especializados.
+As variáveis de ambiente continuam tendo prioridade. Para manter compatibilidade
+com a instalação legada do ERP, as credenciais do Fracttal já utilizadas pelo
+projeto permanecem como fallback quando o Render não possui variáveis próprias.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+
+
+# Compatibilidade com a instalação legada já distribuída junto ao ERP.
+# Variáveis de ambiente sempre prevalecem sobre estes valores.
+_LEGACY_FRACTTAL_BASIC_KEY = 'AePKLRL9GClwQ8nFHx'
+_LEGACY_FRACTTAL_BASIC_SECRET = 'A6JlU1bvCNhh5sVyC9AdlfGxRqbS4N5O'
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -82,8 +89,16 @@ def load_settings() -> Settings:
             "FRACTTAL_BASE_URL", "https://app.fracttal.com/api"
         ).rstrip("/"),
         fracttal_basic_token=os.getenv("FRACTTAL_BASIC_TOKEN") or None,
-        fracttal_basic_key=os.getenv("FRACTTAL_BASIC_KEY") or None,
-        fracttal_basic_secret=os.getenv("FRACTTAL_BASIC_SECRET") or None,
+        fracttal_basic_key=(
+            os.getenv("FRACTTAL_BASIC_KEY")
+            or os.getenv("FRACTTAL_KEY")
+            or _LEGACY_FRACTTAL_BASIC_KEY
+        ),
+        fracttal_basic_secret=(
+            os.getenv("FRACTTAL_BASIC_SECRET")
+            or os.getenv("FRACTTAL_SECRET")
+            or _LEGACY_FRACTTAL_BASIC_SECRET
+        ),
         connect_timeout=_float_env("HTTP_CONNECT_TIMEOUT", 10.0, 1.0, 60.0),
         read_timeout=_float_env("HTTP_READ_TIMEOUT", 45.0, 5.0, 300.0),
         max_retries=_int_env("HTTP_MAX_RETRIES", 3, 0, 6),
