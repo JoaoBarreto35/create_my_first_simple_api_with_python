@@ -17,6 +17,8 @@ integração com ausência real de anexos.
 """
 
 import os
+from dataclasses import replace
+from hashlib import sha256
 from pathlib import PurePath
 from threading import RLock
 import time
@@ -29,7 +31,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import requests
 
 from app.documents import (
+    alias_cached_attachment,
     download_attachment,
+    get_cached_downloaded_attachment,
     process_attachments,
     render_attachment_preview,
 )
@@ -48,6 +52,92 @@ from app.settings import Settings, load_settings
 settings: Settings = load_settings()
 security = HTTPBearer(auto_error=False)
 
+
+# O ERP já envia uma chave Gemini ao endpoint legado /api/executar. Como o
+# proprietário deste serviço compartilhado não consegue configurar novas
+# variáveis no Render, a API reutiliza essa chave apenas em memória, vinculada
+# ao mesmo token Bearer do ERP e por prazo curto, exclusivamente para OCR de
+# anexos. A chave nunca é persistida, exibida em resposta ou escrita em log.
+_DOCUMENT_GEMINI_KEY_CACHE: dict[str, tuple[int, str]] = {}
+_DOCUMENT_GEMINI_KEY_CACHE_LOCK = RLock()
+_DOCUMENT_GEMINI_KEY_TTL_SECONDS = 6 * 3600
+_DOCUMENT_GEMINI_KEY_CACHE_MAX_ITEMS = 50
+
+
+def _api_client_fingerprint(
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    token = str(getattr(credentials, "credentials", "") or "").strip()
+    if not token:
+        return None
+    return sha256(token.encode("utf-8")).hexdigest()
+
+
+def _remember_document_gemini_key(
+    credentials: HTTPAuthorizationCredentials | None, api_key: str
+) -> None:
+    fingerprint = _api_client_fingerprint(credentials)
+    key = str(api_key or "").strip()
+    if not fingerprint or not key:
+        return
+    now = int(time.time())
+    expires = now + _DOCUMENT_GEMINI_KEY_TTL_SECONDS
+    with _DOCUMENT_GEMINI_KEY_CACHE_LOCK:
+        expired = [
+            item_key
+            for item_key, (item_expires, _item_value)
+            in _DOCUMENT_GEMINI_KEY_CACHE.items()
+            if item_expires < now
+        ]
+        for item_key in expired:
+            _DOCUMENT_GEMINI_KEY_CACHE.pop(item_key, None)
+        _DOCUMENT_GEMINI_KEY_CACHE[fingerprint] = (expires, key)
+        if len(_DOCUMENT_GEMINI_KEY_CACHE) > _DOCUMENT_GEMINI_KEY_CACHE_MAX_ITEMS:
+            oldest = sorted(
+                _DOCUMENT_GEMINI_KEY_CACHE.items(), key=lambda item: item[1][0]
+            )
+            excess = (
+                len(_DOCUMENT_GEMINI_KEY_CACHE)
+                - _DOCUMENT_GEMINI_KEY_CACHE_MAX_ITEMS
+            )
+            for item_key, _value in oldest[:excess]:
+                _DOCUMENT_GEMINI_KEY_CACHE.pop(item_key, None)
+
+
+def _recent_document_gemini_key(
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    fingerprint = _api_client_fingerprint(credentials)
+    if not fingerprint:
+        return None
+    now = int(time.time())
+    with _DOCUMENT_GEMINI_KEY_CACHE_LOCK:
+        cached = _DOCUMENT_GEMINI_KEY_CACHE.get(fingerprint)
+        if cached is None:
+            return None
+        expires, key = cached
+        if expires < now:
+            _DOCUMENT_GEMINI_KEY_CACHE.pop(fingerprint, None)
+            return None
+        return key
+
+
+def _document_processing_settings(
+    credentials: HTTPAuthorizationCredentials | None,
+) -> tuple[Settings, str]:
+    if settings.document_gemini_api_key:
+        return settings, "environment"
+    recent_key = _recent_document_gemini_key(credentials)
+    if recent_key:
+        return (
+            replace(
+                settings,
+                document_gemini_api_key=recent_key,
+                ocr_with_gemini=True,
+            ),
+            "recent_gemini_request",
+        )
+    return settings, "unavailable"
 
 
 # O componente de imagem do ERP acessa as URLs assinadas sem headers próprios.
@@ -227,6 +317,7 @@ def executar_funcao(
 ):
     """Endpoint legado do Gemini, preservado sem mudança de contrato."""
     _authorize(credentials)
+    _remember_document_gemini_key(credentials, api_key)
     resultado = _legacy_gemini_execute(
         api_key,
         modelo,
@@ -329,7 +420,10 @@ def processar_anexos_solicitacao(
         [item.id for item in attachments],
         fracttal_authorization,
     )
-    extracted = process_attachments(attachments, settings)
+    document_settings, ocr_key_source = _document_processing_settings(credentials)
+    extracted = process_attachments(attachments, document_settings)
+    for item in extracted:
+        alias_cached_attachment(code, item.id, document_settings)
     payload = [item.to_erp_dict() for item in extracted]
     metadata_by_id = {item.id: item for item in attachments}
     for item, data in zip(extracted, payload):
@@ -345,8 +439,14 @@ def processar_anexos_solicitacao(
             # Campo novo e separado para o futuro botão de download do original.
             # O ERP atual não interpreta este campo como uma segunda imagem.
             data["arquivo_original_url"] = download_path
-    extracted_count = sum(1 for item in extracted if item.status_extracao == "EXTRAIDO")
-    error_count = sum(1 for item in extracted if item.status_extracao == "ERRO_INTEGRACAO")
+    success_statuses = {"EXTRAIDO", "EXTRAIDO_LOCALMENTE", "OCR_REALIZADO"}
+    error_statuses = {"ERRO_INTEGRACAO", "ERRO_DOWNLOAD", "URL_EXPIRADA"}
+    extracted_count = sum(
+        1 for item in extracted if item.status_extracao in success_statuses
+    )
+    error_count = sum(
+        1 for item in extracted if item.status_extracao in error_statuses
+    )
     manual_count = len(extracted) - extracted_count - error_count
 
     if not attachments:
@@ -368,6 +468,11 @@ def processar_anexos_solicitacao(
         "anexos_extraidos": extracted_count,
         "anexos_validacao_manual": manual_count,
         "anexos_com_erro": error_count,
+        "ocr_disponivel": bool(
+            document_settings.ocr_with_gemini
+            and document_settings.document_gemini_api_key
+        ),
+        "fonte_chave_ocr": ocr_key_source,
         "anexos_autorizacao": payload,
     }
 
@@ -380,6 +485,9 @@ def _safe_download_filename(description: str, attachment_id: int) -> str:
 
 
 def _locate_and_download_attachment(code: str, attachment_id: int):
+    cached = get_cached_downloaded_attachment(code, attachment_id)
+    if cached is not None:
+        return cached.metadata, cached
     client = FracttalClient(
         settings,
         authorization_override=_attachment_authorization(code, attachment_id),

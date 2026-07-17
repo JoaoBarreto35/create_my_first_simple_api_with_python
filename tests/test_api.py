@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 import pytest
 
 import main
-from app.documents import DownloadedAttachment, extract_attachment
+from app.documents import (
+    DownloadedAttachment,
+    cache_downloaded_attachment,
+    clear_downloaded_attachment_cache,
+    extract_attachment,
+)
 from app.errors import IntegrationError
 from app.fracttal import AttachmentMetadata, FracttalClient
 from app.settings import load_settings
@@ -159,9 +164,11 @@ def test_plain_text_extraction(configured_settings):
         sha256_hex="abc",
     )
     extracted = extract_attachment(downloaded, configured_settings)
-    assert extracted.status_extracao == "EXTRAIDO"
+    assert extracted.status_extracao == "EXTRAIDO_LOCALMENTE"
     assert "de acordo" in extracted.texto_extraido
-    assert extracted.metodo_extracao == "plain_text"
+    assert extracted.metodo_extracao == "TEXTO_LOCAL"
+    assert extracted.evidencias
+    assert "decisão final permanece no ERP" in extracted.interpretacao
 
 
 class FakeResponse:
@@ -642,3 +649,239 @@ def test_attachment_404_contains_exact_context(client, monkeypatch):
     assert body["endpoint"] == "work_requests_attachments/51329"
     assert "campo code" in body["message"]
 
+
+
+class DownloadResponse:
+    def __init__(self, content: bytes, *, status_code: int = 200, content_type: str = "image/jpeg"):
+        self.status_code = status_code
+        self.headers = {
+            "Content-Type": content_type,
+            "Content-Length": str(len(content)),
+        }
+        self.url = "https://fracttal-fs.s3.amazonaws.com/company/request/file"
+        self._content = content
+
+    def iter_content(self, chunk_size=65536):
+        del chunk_size
+        if self._content:
+            yield self._content
+
+    def close(self):
+        return None
+
+
+class DownloadSession:
+    def __init__(self, response):
+        self.response = response
+
+    def get(self, *args, **kwargs):
+        del args, kwargs
+        return self.response
+
+    def close(self):
+        return None
+
+
+def test_download_diagnostics_and_unexpected_html(configured_settings, monkeypatch):
+    import app.documents as documents
+
+    metadata = AttachmentMetadata(
+        91,
+        51329,
+        "autorizacao.jpg",
+        "https://fracttal-fs.s3.amazonaws.com/file",
+    )
+    response = DownloadResponse(
+        b"<html><body>AccessDenied</body></html>",
+        content_type="text/html",
+    )
+    monkeypatch.setattr(documents, "build_session", lambda settings: DownloadSession(response))
+
+    result = documents.process_attachment(metadata, configured_settings)
+    assert result.status_extracao == "URL_EXPIRADA"
+    assert result.download_status == 200
+    assert result.error_type == "attachment_signed_url_expired"
+    assert result.error_stage == "baixar_anexo_fracttal"
+    assert "página de erro" in " ".join(result.avisos)
+
+
+def test_successful_download_reports_http_mime_size_and_method(configured_settings, monkeypatch):
+    import app.documents as documents
+
+    metadata = AttachmentMetadata(
+        92,
+        51329,
+        "autorizacao.txt",
+        "https://fracttal-fs.s3.amazonaws.com/file",
+    )
+    content = b"Responsavel autorizado e de acordo com a copia de chaves."
+    response = DownloadResponse(content, content_type="text/plain; charset=utf-8")
+    monkeypatch.setattr(documents, "build_session", lambda settings: DownloadSession(response))
+
+    result = documents.process_attachment(metadata, configured_settings)
+    assert result.status_extracao == "EXTRAIDO_LOCALMENTE"
+    assert result.download_status == 200
+    assert result.mime_type == "text/plain"
+    assert result.tamanho_bytes == len(content)
+    assert result.metodo_extracao == "TEXTO_LOCAL"
+    assert result.evidencias
+
+
+def test_processed_endpoint_reuses_recent_gemini_key_from_same_erp(client, monkeypatch):
+    main._DOCUMENT_GEMINI_KEY_CACHE.clear()
+    monkeypatch.setattr(main, "_legacy_gemini_execute", lambda *args: (True, "{}"))
+    gemini_key = "AQ.test-document-key"
+    warm = client.get(
+        "/api/executar",
+        headers=auth_headers(),
+        params={
+            "api_key": gemini_key,
+            "modelo": "gemini-2.5-flash-lite",
+            "CONTEXTO_CLASSIFICACAO": "teste",
+            "texto": "teste",
+        },
+    )
+    assert warm.status_code == 200
+
+    item = AttachmentMetadata(
+        93,
+        51329,
+        "autorizacao.jpg",
+        "https://fracttal-fs.s3.amazonaws.com/file",
+    )
+    monkeypatch.setattr(
+        FracttalClient,
+        "list_request_attachments",
+        lambda self, code, **kwargs: ([item], 1),
+    )
+    captured = {}
+
+    class FakeExtracted:
+        id = 93
+        mime_type = "image/jpeg"
+        status_extracao = "OCR_REALIZADO"
+
+        def to_erp_dict(self):
+            return {
+                "id": 93,
+                "id_request": 51329,
+                "description": "autorizacao.jpg",
+                "mime_type": "image/jpeg",
+                "texto_extraido": "De acordo",
+                "status_extracao": "OCR_REALIZADO",
+            }
+
+    def fake_process(attachments, settings):
+        captured["key"] = settings.document_gemini_api_key
+        captured["enabled"] = settings.ocr_with_gemini
+        return [FakeExtracted()]
+
+    monkeypatch.setattr(main, "process_attachments", fake_process)
+    response = client.get(
+        "/api/fracttal/solicitacoes/51329/anexos/processados",
+        headers=auth_headers(),
+    )
+    assert response.status_code == 200
+    assert captured == {"key": gemini_key, "enabled": True}
+    body = response.json()
+    assert body["ocr_disponivel"] is True
+    assert body["fonte_chave_ocr"] == "recent_gemini_request"
+
+
+def test_preview_uses_file_cached_during_processing_without_second_fracttal_query(
+    client, configured_settings, monkeypatch
+):
+    item = AttachmentMetadata(
+        94,
+        51329,
+        "autorizacao.jpg",
+        "https://fracttal-fs.s3.amazonaws.com/file",
+    )
+    clear_downloaded_attachment_cache()
+    cache_downloaded_attachment(
+        DownloadedAttachment(
+            metadata=item,
+            content=b"cached-original",
+            mime_type="image/jpeg",
+            sha256_hex="abc",
+        ),
+        configured_settings,
+        request_code="51329",
+    )
+    calls = {"fracttal": 0}
+
+    def fake_list(self, code, **kwargs):
+        calls["fracttal"] += 1
+        if calls["fracttal"] > 1:
+            raise AssertionError("A prévia não deve consultar novamente o Fracttal")
+        return [item], 1
+
+    class FakeExtracted:
+        id = 94
+        mime_type = "image/jpeg"
+        status_extracao = "OCR_REALIZADO"
+
+        def to_erp_dict(self):
+            return {
+                "id": 94,
+                "id_request": 51329,
+                "description": "autorizacao.jpg",
+                "mime_type": "image/jpeg",
+                "texto_extraido": "De acordo",
+                "status_extracao": "OCR_REALIZADO",
+            }
+
+    monkeypatch.setattr(FracttalClient, "list_request_attachments", fake_list)
+    monkeypatch.setattr(main, "process_attachments", lambda attachments, settings: [FakeExtracted()])
+    monkeypatch.setattr(main, "render_attachment_preview", lambda value: (value.content, "image/jpeg"))
+
+    processed = client.get(
+        "/api/fracttal/solicitacoes/51329/anexos/processados",
+        headers=auth_headers(),
+    )
+    preview_url = processed.json()["anexos_autorizacao"][0]["imagem_analisada"]
+    preview = client.get(preview_url)
+    assert preview.status_code == 200
+    assert preview.content == b"cached-original"
+    assert calls["fracttal"] == 1
+
+
+
+def test_image_ocr_success_has_explicit_status_and_interpretation(configured_settings, monkeypatch):
+    import app.documents as documents
+    from dataclasses import replace
+
+    metadata = AttachmentMetadata(
+        95,
+        51329,
+        "autorizacao.jpg",
+        "https://fracttal-fs.s3.amazonaws.com/file",
+    )
+    downloaded = DownloadedAttachment(
+        metadata=metadata,
+        content=b"\xff\xd8\xfffake",
+        mime_type="image/jpeg",
+        sha256_hex="abc",
+        download_status=200,
+        response_content_type="image/jpeg",
+        final_host="fracttal-fs.s3.amazonaws.com",
+    )
+    settings = replace(
+        configured_settings,
+        document_gemini_api_key="AQ.test",
+        ocr_with_gemini=True,
+    )
+    monkeypatch.setattr(
+        documents,
+        "_transcribe_with_gemini",
+        lambda content, mime_type, settings: (
+            "Responsável de acordo e autorização aprovada para cópia de chaves.",
+            "",
+        ),
+    )
+    result = documents.extract_attachment(downloaded, settings)
+    assert result.status_extracao == "OCR_REALIZADO"
+    assert result.metodo_extracao == "OCR_GEMINI_IMAGEM"
+    assert result.download_status == 200
+    assert result.evidencias
+    assert "decisão final permanece no ERP" in result.interpretacao
